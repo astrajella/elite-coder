@@ -1,5 +1,5 @@
 
-import os, sqlite3, csv, io
+import os, sqlite3, csv, io, time, json
 from datetime import date, datetime, timedelta
 from statistics import mean
 
@@ -91,31 +91,8 @@ def export_daily_csv():
         writer.writerow(r)
     return output.getvalue()
 
-import sqlite3, os, time, json
-LEDGER_DB_PATH = os.getenv('LEDGER_DB_PATH','./ledger.db')
-def _conn():
-    return sqlite3.connect(LEDGER_DB_PATH)
-
-def log_commit(commit_id, patches_meta):
-    conn = _conn(); cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS commits(
-        id TEXT PRIMARY KEY, ts REAL, meta TEXT
-    )""")
-    cur.execute("INSERT OR REPLACE INTO commits(id, ts, meta) VALUES(?,?,?)", (commit_id, time.time(), json.dumps(patches_meta)))
-    conn.commit(); conn.close()
-
-def get_history():
-    conn = _conn(); cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS commits(
-        id TEXT PRIMARY KEY, ts REAL, meta TEXT
-    )""")
-    cur.execute("SELECT id, ts, meta FROM commits ORDER BY ts DESC LIMIT 200")
-    rows = [{"id": r[0], "ts": r[1], "meta": json.loads(r[2] or "{}")} for r in cur.fetchall()]
-    conn.close(); return rows
-
 
 def get_stats():
-    import sqlite3
     conn = sqlite3.connect(LEDGER_DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -140,3 +117,20 @@ def get_stats():
     conn.close()
     return {"persona": persona_stats, "tool": tool_stats, "totals": totals}
 
+
+def log_commit(commit_id, patches_meta):
+    conn = sqlite3.connect(LEDGER_DB_PATH); cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS commits(
+        id TEXT PRIMARY KEY, ts REAL, meta TEXT
+    )""")
+    cur.execute("INSERT OR REPLACE INTO commits(id, ts, meta) VALUES(?,?,?)", (commit_id, time.time(), json.dumps(patches_meta)))
+    conn.commit(); conn.close()
+
+def get_history():
+    conn = sqlite3.connect(LEDGER_DB_PATH); cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS commits(
+        id TEXT PRIMARY KEY, ts REAL, meta TEXT
+    )""")
+    cur.execute("SELECT id, ts, meta FROM commits ORDER BY ts DESC LIMIT 200")
+    rows = [{"id": r[0], "ts": r[1], "meta": json.loads(r[2] or "{}")} for r in cur.fetchall()]
+    conn.close(); return rows

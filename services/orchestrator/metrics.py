@@ -1,5 +1,4 @@
 from services.orchestrator.validation_wrapper import wrap_tool_call
-from services.orchestrator.metrics import ORCH_TOOL_CALLS, ORCH_TOOL_LATENCY
 
 from prometheus_client import Counter, Histogram
 

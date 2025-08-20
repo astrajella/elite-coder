@@ -1,9 +1,7 @@
-from services.orchestrator.validation_wrapper import wrap_tool_call
-from services.orchestrator.metrics import ORCH_TOOL_CALLS, ORCH_TOOL_LATENCY
 
 from pydantic import BaseModel, Field, validator
 from typing import Any, Dict, List, Literal, Optional
-from services.schemas import CodePatchList, FilePatch, ErrorResponse
+from services.common.schemas import CodePatchList, FilePatch, ErrorResponse
 
 # Canonical tool output envelope every tool must return
 class ToolOutput(BaseModel):
@@ -20,18 +18,6 @@ class ToolOutput(BaseModel):
     persona: Optional[str] = None
     run_id: Optional[str] = None
     step_id: Optional[str] = None
-
-class FilePatch(BaseModel):
-    path: str
-    type: Literal['create','replace','patch']
-    content: str
-
-class CodePatchList(BaseModel):
-    plan_id: str
-    step_id: str
-    patches: List[FilePatch]
-    author: Optional[str] = "coder_agent"
-    explain: Optional[str] = None
 
 class SummarizerSchema(BaseModel):
     summary: str

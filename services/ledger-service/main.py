@@ -1,12 +1,14 @@
 import logging
 import os
-import structlog
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST, sqlite3, csv, io
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from fastapi import FastAPI, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from datetime import datetime, date
 import json
+import sqlite3
+import csv
+import io
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="ledger-service")
@@ -23,7 +25,8 @@ def init_db_postgres():
     conn.commit(); conn.close()
 
 # modify init_db call
-if USE_PG := USE_POSTGRES:
+USE_PG = USE_POSTGRES
+if USE_PG:
     try:
         init_db_postgres()
     except Exception as e:
@@ -138,17 +141,6 @@ def pg_execute_with_retry(query, params=(), retries=2):
             last_exc = e
             time.sleep(0.5)
     raise last_exc
-
-
-@app.get('/metrics')
-async def metrics():
-    # expose total runs and total cost
-    try:
-        conn = sqlite3.connect(DB); cur = conn.cursor(); cur.execute('SELECT COUNT(*), COALESCE(SUM(cost),0) FROM runs'); r = cur.fetchone(); conn.close(); total_runs = r[0]; total_cost = r[1]
-    except Exception:
-        total_runs = 0; total_cost = 0.0
-    text = f"ledger_runs_total {total_runs}\nledger_cost_total {total_cost}\n"
-    return Response(text, media_type='text/plain')
 
 
 @app.get("/metrics")
