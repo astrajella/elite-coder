@@ -1,1 +1,33 @@
-'use client'; import {useState} from 'react'; export default function Login(){ const [u,setU]=useState('dev'); const [p,setP]=useState('pass'); const [m,setM]=useState(''); async function doLogin(){ const res = await fetch('/api/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username:u,password:p})}); if(res.ok){ setM('ok'); window.location.href='/'; } else { setM('failed'); } } return (<div style={{padding:20, background:'#071025', color:'#e6eef8'}}><h1>Login</h1><input value={u} onChange={e=>setU(e.target.value)}/><input type='password' value={p} onChange={e=>setP(e.target.value)}/><button onClick={doLogin}>Login</button><div>{m}</div></div>) }
+'use client'
+
+import { useState } from 'react'
+
+export default function Login() {
+  const [u, setU] = useState('dev')
+  const [p, setP] = useState('pass')
+  const [m, setM] = useState('')
+
+  async function doLogin() {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p })
+    })
+    if (res.ok) {
+      setM('ok')
+      window.location.href = '/'
+    } else {
+      setM('failed')
+    }
+  }
+
+  return (
+    <div style={{ padding: 20, background: '#071025', color: '#e6eef8' }}>
+      <h1>Login</h1>
+      <input value={u} onChange={e => setU(e.target.value)} />
+      <input type='password' value={p} onChange={e => setP(e.target.value)} />
+      <button onClick={doLogin}>Login</button>
+      <div>{m}</div>
+    </div>
+  )
+}

@@ -45,7 +45,7 @@ async def call_remote_tool(path: str, payload: Dict[str, Any]) -> Dict[str, Any]
     """Call a remote tool via HTTP if AGENT_CORE_URL set, else provide a conservative local output."""
     base = AGENT_CORE_URL.rstrip('/') if AGENT_CORE_URL else None
     if base:
-        url = f"{base}/{path.lstrip('/')}")
+        url = f"{base}/{path.lstrip('/')}"
     else:
         url = None
     if url:

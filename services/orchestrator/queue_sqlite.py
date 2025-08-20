@@ -1,7 +1,10 @@
-from services.orchestrator.validation_wrapper import wrap_tool_call
-from services.orchestrator.metrics import ORCH_TOOL_CALLS, ORCH_TOOL_LATENCY
 
-import os, json, time, asyncio, aiosqlite
+import os
+import json
+import time
+import asyncio
+import aiosqlite
+import uuid
 from typing import Optional, Dict, Any
 
 DB_PATH = os.getenv('ORCH_QUEUE_DB', '/tmp/orchestrator_queue.db')
@@ -172,8 +175,6 @@ async def claim_next_fair(worker_id: str, fairness: bool = True):
         return {'run_id': row['id'], 'project': row['project'], 'plan': json.loads(row['plan_json'])}
 
 
-import aiosqlite, time
-
 async def init_run_steps(db_path=None):
     db_path = db_path or os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
     async with aiosqlite.connect(db_path) as db:
@@ -219,8 +220,6 @@ async def step_list(run_id: str, limit: int = 200, offset: int = 0, db_path=None
         rows = await cur.fetchall()
         return [{'step_id':r[0], 'status':r[1], 'attempts':r[2], 'updated_at':r[3], 'trace_id': r[4]} for r in rows]
 
-
-import aiosqlite, time, os, uuid
 
 async def init_leases(db_path=None):
     db_path = db_path or os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')

@@ -5,8 +5,6 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
 import sqlite3, uuid
-
-from pydantic import BaseModel
 import os
 import structlog
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST, time, httpx, json
@@ -106,7 +104,7 @@ def verify_jwt(authorization: str):
         raise HTTPException(status_code=403, detail="Invalid token")
 
 @app.post("/invoke_tool")
-async def invoke_tool(call: ToolCall, authorization: str = Header(None), user = Depends(get_current_user)):
+async def invoke_tool(call: ToolCall, authorization: str = Header(None), user = Depends(get_current_user), x_csrf_token: str = Header(None)):
     require_role(user, ['developer','admin'])
     if not x_csrf_token or not validate_csrf_for_user(user.get('username'), x_csrf_token):
         raise HTTPException(status_code=403, detail='invalid csrf token')
@@ -129,7 +127,7 @@ from fastapi.responses import StreamingResponse
 import importlib, asyncio
 
 @app.get('/stream')
-async def stream_provider(provider: str = 'openrouter', prompt: str = 'Hello', authorization: str = Header(None), user = Depends(get_current_user)):
+async def stream_provider(provider: str = 'openrouter', prompt: str = 'Hello', authorization: str = Header(None), user = Depends(get_current_user), x_csrf_token: str = Header(None)):
     # very light auth check
     require_role(user, ['developer','admin'])
     if not x_csrf_token or not validate_csrf_for_user(user.get('username'), x_csrf_token):
@@ -208,8 +206,6 @@ async def commit_patches(commit_message: str = Body(...), patches: List[FilePatc
     require_role(user, ['developer','admin'])
     if not x_csrf_token or not validate_csrf_for_user(user.get('username'), x_csrf_token):
         raise HTTPException(status_code=403, detail='invalid csrf token')
-    if not x_csrf_token or not validate_csrf_for_user(user.get('username'), x_csrf_token):
-        raise HTTPException(status_code=403, detail='invalid csrf token')
     applied = []
     for p in patches:
         # safely write file relative to ARTIFACTS_DIR
@@ -244,7 +240,7 @@ async def queue_fine_tune(req: FineTuneReq, user = Depends(get_current_user), x_
     return {'job_id': jid, 'status': 'queued'}
 
 @app.get('/fine_tune/{job_id}')
-async def get_fine_tune(job_id: int, user = Depends(get_current_user)):
+async def get_fine_tune(job_id: int, user = Depends(get_current_user), x_csrf_token: str = Header(None)):
     require_role(user, ['developer','admin'])
     if not x_csrf_token or not validate_csrf_for_user(user.get('username'), x_csrf_token):
         raise HTTPException(status_code=403, detail='invalid csrf token')
@@ -274,7 +270,7 @@ async def refresh_token(body: dict, authorization: str = Header(None)):
 from fastapi.responses import FileResponse
 
 @app.get('/artifacts')
-async def list_artifacts(user = Depends(get_current_user)):
+async def list_artifacts(user = Depends(get_current_user), x_csrf_token: str = Header(None)):
     require_role(user, ['developer','admin'])
     if not x_csrf_token or not validate_csrf_for_user(user.get('username'), x_csrf_token):
         raise HTTPException(status_code=403, detail='invalid csrf token')
@@ -288,7 +284,7 @@ async def list_artifacts(user = Depends(get_current_user)):
     return {'artifacts': out}
 
 @app.get('/artifacts/download')
-async def download_artifact(name: str, user = Depends(get_current_user)):
+async def download_artifact(name: str, user = Depends(get_current_user), x_csrf_token: str = Header(None)):
     require_role(user, ['developer','admin'])
     if not x_csrf_token or not validate_csrf_for_user(user.get('username'), x_csrf_token):
         raise HTTPException(status_code=403, detail='invalid csrf token')
@@ -399,20 +395,6 @@ async def reset_password(body: dict):
     else:
         conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('UPDATE users SET hashed_password=? WHERE username=?', (h, uname)); conn.commit(); conn.close()
     return {'ok': True}
-
-
-@app.get('/metrics')
-async def metrics():
-    # simple Prometheus-style metrics
-    # counts: commits, runs logged
-    try:
-        conn = sqlite3.connect(USER_DB)
-        cur = conn.cursor(); cur.execute('SELECT COUNT(*) FROM commits'); commits = cur.fetchone()[0]
-        conn.close()
-    except Exception:
-        commits = 0
-    text = f"agent_commits_total {commits}\n"
-    return Response(text, media_type='text/plain')
 
 
 @app.get('/auth/validate')
