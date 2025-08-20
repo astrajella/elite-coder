@@ -1,0 +1,8 @@
+
+FROM python:3.11-slim
+WORKDIR /app
+COPY . /app
+RUN pip install --no-cache-dir flask
+COPY docker/entrypoint.sh /app/docker/entrypoint.sh
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+CMD ["python", "services/api/app.py"]

@@ -1,0 +1,36 @@
+name: Playwright CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start services
+        run: |
+          docker compose up -d --build
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install dependencies & Playwright
+        run: |
+          npm ci || npm i
+          npx playwright install --with-deps
+      - name: Wait for services
+        run: |
+          sleep 8
+      - name: Run Playwright tests
+        env:
+          BASE_URL: http://localhost:8000
+        run: |
+          npx playwright test --config=playwright.config.ts
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose down --volumes

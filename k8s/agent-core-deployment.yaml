@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-core
+spec:
+  ports:
+    - port: 8001
+  selector:
+    app: agent-core
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-core
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-core
+  template:
+    metadata:
+      labels:
+        app: agent-core
+    spec:
+      containers:
+        - name: agent-core
+          image: ai-agent-core:latest
+          ports:
+            - containerPort: 8001
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 10

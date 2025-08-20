@@ -1,0 +1,32 @@
+
+version: "3.9"
+services:
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile.validator
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+    ports:
+      - "8000:8000"
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+      - AGENT_CORE_VALIDATE_URL=http://validator:8000/
+    ports:
+      - "8002:8002"
+    depends_on:
+      - validator
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      - JWT_SECRET=${JWT_SECRET}
+    ports:
+      - "8003:8003"

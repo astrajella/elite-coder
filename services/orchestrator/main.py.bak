@@ -1,0 +1,663 @@
+from services.common.schemas import CodePatchList, FilePatch, TestResultsSchema
+from services.common.validation import validate_payload
+import aiohttp
+import asyncio
+import csv
+from services.schemas import CodePatchList, FilePatch, ErrorResponse
+
+
+class PlanStep(BaseModel):
+    step_id: Optional[str]
+    description: str
+    persona: Optional[str] = 'coder'
+    tool: Optional[str] = 'generate_code'
+    payload: dict = {}
+    expected_schema: Optional[str] = None
+    idempotency_key: Optional[str] = None
+
+class PlanSchema(BaseModel):
+    plan_id: Optional[str]
+    steps: List[PlanStep]
+    project: Optional[str] = None
+    @validator('steps')
+    def non_empty(cls, v):
+        if not v:
+            raise ValueError('plan must contain at least one step')
+        return v
+
+import os
+ORCH_API_KEY = os.getenv('ORCH_API_KEY','')
+
+def require_api_key(request):
+    if not ORCH_API_KEY:
+        return # no key configured
+    key = request.headers.get('x-orch-api-key') or request.headers.get('authorization')
+    if not key:
+        raise HTTPException(status_code=401, detail='missing api key')
+    # support Bearer token in Authorization
+    if key.lower().startswith('bearer '):
+        key = key.split(' ',1)[1]
+    if key != ORCH_API_KEY:
+        raise HTTPException(status_code=403, detail='invalid api key')
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Request
+from . import queue_sqlite
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry import trace
+from pydantic import BaseModel
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+import os, time, hmac, hashlib, base64, json
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+HTTP_BEARER = HTTPBearer(auto_error=False)
+
+def _consttime_eq(a,b):
+    return hmac.compare_digest(str(a or ''), str(b or ''))
+
+def _jwt_decode(token: str, secret: str):
+    try:
+        header_b64, payload_b64, sig_b64 = token.split('.')
+        def _b64d(s):
+            s += '=' * (-len(s) % 4)
+            return base64.urlsafe_b64decode(s.encode())
+        signing_input = f"{header_b64}.{payload_b64}".encode()
+        sig = base64.urlsafe_b64decode(sig_b64 + '==')
+        expect = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expect):
+            return None
+        payload = json.loads(_b64d(payload_b64))
+        if payload.get('exp') and time.time() > payload['exp']:
+            return None
+        return payload
+    except Exception:
+        return None
+
+async def auth_dependency(api_key: str = Depends(API_KEY_HEADER), bearer: HTTPAuthorizationCredentials = Depends(HTTP_BEARER)):
+    required_key = os.getenv('ORCH_API_KEY')
+    jwt_secret = os.getenv('ORCH_JWT_SECRET')
+    if required_key and api_key and _consttime_eq(api_key, required_key):
+        return {'mode':'api_key'}
+    if bearer and jwt_secret:
+        payload = _jwt_decode(bearer.credentials, jwt_secret)
+        if payload:
+            return {'mode':'jwt', 'sub':payload.get('sub')}
+    if required_key or jwt_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return {'mode':'open'}
+, Field, validator
+from typing import List, Optional
+from fastapi.responses import StreamingResponse, JSONResponse
+import uuid, time, os, asyncio, json
+from . import store
+from .scheduler import execute_plan
+\1
+# Prometheus metrics
+ORCH_TOOL_CALLS = Counter("orchestrator_tool_calls_total","Tool invocations",["tool","persona","status"])
+ORCH_STEP_LATENCY = Histogram("orchestrator_step_seconds","Per-step latency seconds",["step"])
+ORCH_RUN_ERRORS = Counter("orchestrator_errors_total","Orchestrator errors",["endpoint"])
+
+@app.post('/orchestrate')
+async def orchestrate(request: Request, background_tasks: BackgroundTasks):
+    require_api_key(request)
+    body = await request.json()
+    try:
+        plan_obj = PlanSchema(**body.get('plan'))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f'Invalid plan: {e}')
+    plan = plan_obj.dict() or body
+    run_id = str(uuid.uuid4())
+    # create initial run entry
+    store.save_run(run_id, plan, 'pending', {'steps': []})
+    # schedule background execution
+    async def _run():
+        await queue_run(run_id, plan)
+    loop = asyncio.get_event_loop()
+    loop.create_task(_run())
+    return {'run_id': run_id, 'status': 'scheduled'}
+
+@app.get('/runs/{run_id}')
+async def get_run(run_id: str):
+    r = store.get_run(run_id)
+    if not r: raise HTTPException(status_code=404, detail='not found')
+    return r
+
+@app.get('/runs/stream/{run_id}')
+async def stream_run(run_id: str):
+    async def event_stream():
+        import time
+        while True:
+            r = store.get_run(run_id)
+            if not r:
+                yield f"data: {json.dumps({'error':'not found'})}\n\n"
+                return
+            yield f"data: {json.dumps(r)}\n\n"
+            if r.get('state') in ('succeeded','failed'):
+                return
+            await asyncio.sleep(1.0)
+    return StreamingResponse(event_stream(), media_type='text/event-stream')
+
+@app.get('/stats')
+async def stats():
+    # basic stats: count runs by state
+    import sqlite3
+    db = os.getenv('ORCH_DB','./services/orchestrator/orch_runs.db')
+    conn = sqlite3.connect(db); cur = conn.cursor(); cur.execute("SELECT state, COUNT(*) FROM runs GROUP BY state"); rows = cur.fetchall(); conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+
+from fastapi.responses import StreamingResponse
+import io, csv, math
+
+@app.get('/runs/{run_id}/export_csv')
+async def export_csv(run_id: str):
+    r = store.get_run(run_id)
+    if not r:
+        raise HTTPException(status_code=404, detail='not found')
+    # Build CSV: step_id,description,persona,tool,status,started_at,ended_at,duration_seconds,tokens,cost
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['step_id','description','persona','tool','status','started_at','ended_at','duration_seconds','tokens','cost'])
+    for s in (r.get('trace',{}) or {}).get('steps', []):
+        step_id = s.get('step_id') or ''
+        desc = s.get('description','')
+        persona = s.get('persona') or (s.get('result',{}).get('response',{}).get('persona') if s.get('result') else '')
+        tool = s.get('tool') or (s.get('result',{}).get('response',{}).get('tool') if s.get('result') else '')
+        status = s.get('status','')
+        started = s.get('started_at') or ''
+        ended = s.get('ended_at') or ''
+        duration = ''
+        # prefer reported duration from result if available
+        if s.get('result') and isinstance(s['result'], dict):
+            duration = s['result'].get('duration') or ''
+        if not duration and started and ended:
+            try:
+                duration = float(ended) - float(started)
+            except Exception:
+                duration = ''
+        tokens = ''
+        cost = ''
+        if s.get('result') and isinstance(s['result'], dict):
+            resp = s['result'].get('response') or {}
+            tokens = resp.get('tokens') or resp.get('token_est') or ''
+            cost = resp.get('cost') or resp.get('cost_est') or ''
+        writer.writerow([step_id, desc, persona, tool, status, started, ended, duration, tokens, cost])
+    output.seek(0)
+    headers = {'Content-Disposition': f'attachment; filename="run_{run_id}_metrics.csv"'}
+    return StreamingResponse(output, media_type='text/csv', headers=headers)
+
+
+@app.post('/runs/{run_id}/resume')
+async def resume_run(run_id: str, background_tasks: BackgroundTasks, request: Request):
+    require_api_key(request)
+    r = store.get_run(run_id)
+    if not r: raise HTTPException(status_code=404, detail='not found')
+    if r.get('state') in ('succeeded','running'):
+        return {'ok': False, 'message': 'cannot resume in state '+r.get('state')}
+    # schedule background execution from stored plan
+    async def _run():
+        await execute_plan(run_id, r.get('plan'))
+    loop = asyncio.get_event_loop(); loop.create_task(_run())
+    return {'ok': True, 'status':'resumed', 'run_id': run_id}
+
+@app.post('/runs/{run_id}/cancel')
+async def cancel_run(run_id: str, request: Request):
+    require_api_key(request)
+    r = store.get_run(run_id)
+    if not r: raise HTTPException(status_code=404, detail='not found')
+    store.mark_cancelled(run_id)
+    return {'ok': True, 'status':'cancelled', 'run_id': run_id}
+
+
+from fastapi import Response
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+
+@app.get('/metrics')
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+FastAPIInstrumentor.instrument_app(app)
+
+
+@app.on_event("startup")
+async def startup_event():
+    await queue_sqlite.init()
+
+
+@app.get('/healthz')
+async def healthz():
+    return {'ok': True, 'status': 'healthy'}
+
+@app.get('/readyz')
+async def _guard_ready(dep=Depends(auth_dependency)): pass
+@app.get('/readyz')
+async def readyz():
+    stats = await queue_sqlite.stats()
+    return {'ok': True, 'queue': stats}
+
+
+@app.post('/admin/drain/start')
+async def _guard1(dep=Depends(auth_dependency)): pass
+@app.post('/admin/drain/start')
+async def start_drain():
+    await set_draining(True)
+    return {'ok': True, 'draining': True}
+
+@app.post('/admin/drain/stop')
+async def _guard2(dep=Depends(auth_dependency)): pass
+@app.post('/admin/drain/stop')
+async def stop_drain():
+    await set_draining(False)
+    return {'ok': True, 'draining': False}
+
+
+from pydantic import BaseModel
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
+import os, time, hmac, hashlib, base64, json
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+HTTP_BEARER = HTTPBearer(auto_error=False)
+
+def _consttime_eq(a,b):
+    return hmac.compare_digest(str(a or ''), str(b or ''))
+
+def _jwt_decode(token: str, secret: str):
+    try:
+        header_b64, payload_b64, sig_b64 = token.split('.')
+        def _b64d(s):
+            s += '=' * (-len(s) % 4)
+            return base64.urlsafe_b64decode(s.encode())
+        signing_input = f"{header_b64}.{payload_b64}".encode()
+        sig = base64.urlsafe_b64decode(sig_b64 + '==')
+        expect = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expect):
+            return None
+        payload = json.loads(_b64d(payload_b64))
+        if payload.get('exp') and time.time() > payload['exp']:
+            return None
+        return payload
+    except Exception:
+        return None
+
+async def auth_dependency(api_key: str = Depends(API_KEY_HEADER), bearer: HTTPAuthorizationCredentials = Depends(HTTP_BEARER)):
+    required_key = os.getenv('ORCH_API_KEY')
+    jwt_secret = os.getenv('ORCH_JWT_SECRET')
+    if required_key and api_key and _consttime_eq(api_key, required_key):
+        return {'mode':'api_key'}
+    if bearer and jwt_secret:
+        payload = _jwt_decode(bearer.credentials, jwt_secret)
+        if payload:
+            return {'mode':'jwt', 'sub':payload.get('sub')}
+    if required_key or jwt_secret:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return {'mode':'open'}
+
+
+class WeightIn(BaseModel):
+    project: str
+    weight: int = 1
+
+@app.get('/admin/fairness/weights')
+async def _guard3(dep=Depends(auth_dependency)): pass
+@app.get('/admin/fairness/weights')
+async def get_weights():
+    return await queue_sqlite.get_project_weights()
+
+@app.post('/admin/fairness/weights')
+async def _guard4(dep=Depends(auth_dependency)): pass
+@app.post('/admin/fairness/weights')
+async def set_weight(w: WeightIn):
+    await queue_sqlite.set_project_weight(w.project, w.weight)
+    return {'ok': True}
+
+@app.post('/admin/reaper/run')
+async def _guard5(dep=Depends(auth_dependency)): pass
+@app.post('/admin/reaper/run')
+async def run_reaper():
+    await queue_sqlite.reap_stale(float(os.getenv('ORCH_HEARTBEAT_TIMEOUT','120')))
+    return {'ok': True}
+
+
+@app.get('/admin/export/run_steps/{run_id}.ndjson')
+async def export_run_steps_ndjson(run_id: str, dep=Depends(auth_dependency)):
+    rows = await queue_sqlite.step_list(run_id)
+    def gen():
+        for r in rows:
+            yield json.dumps(r) + "\n"
+    return StreamingResponse(gen(), media_type='application/x-ndjson')
+
+@app.get('/admin/export/run_steps/{run_id}.csv')
+async def export_run_steps_csv(run_id: str, dep=Depends(auth_dependency)):
+    rows = await queue_sqlite.step_list(run_id)
+    def gen():
+        import io
+        buf = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+                yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        else:
+            yield ""
+    return StreamingResponse(gen(), media_type='text/csv')
+
+
+@app.get('/admin/export/run_steps_all.csv')
+async def export_run_steps_all_csv(limit: int = 1000, offset: int = 0, dep=Depends(auth_dependency)):
+    rows = await queue_sqlite.step_list_all(limit=limit, offset=offset)
+    def gen():
+        import io, csv
+        buf = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+                yield buf.getvalue(); buf.seek(0); buf.truncate(0)
+        else:
+            yield ""
+    return StreamingResponse(gen(), media_type='text/csv')
+
+
+@app.delete('/admin/runs/{run_id}')
+async def admin_purge_run(run_id: str, dep=Depends(auth_dependency)):
+    # Cautious purge: remove steps, leases, executions for run_id
+    try:
+        import aiosqlite, time
+        db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("DELETE FROM run_steps WHERE run_id=?", (run_id,))
+            await db.execute("DELETE FROM leases WHERE run_id=?", (run_id,))
+            await db.execute("DELETE FROM executions WHERE run_id=?", (run_id,))
+            await db.commit()
+        return {"ok": True, "purged": run_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post('/admin/compact')
+async def admin_compact(dep=Depends(auth_dependency)):
+    # VACUUM db
+    try:
+        db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.execute("VACUUM")
+        conn.close()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/admin/export/histograms.csv')
+async def export_histograms(dep=Depends(auth_dependency)):
+    # Parse generate_latest() exposition to extract *_bucket lines and dump CSV
+    expo = generate_latest().decode('utf-8', errors='ignore')
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["metric","le","count"])
+    for line in expo.splitlines():
+        if line.startswith("orch_step_duration_seconds_bucket") or line.startswith("orch_lease_wait_seconds_bucket"):
+            try:
+                name = line.split("_bucket{")[0]
+                le = line.split('le="')[1].split('"')[0]
+                count = line.split("} ")[1]
+                w.writerow([name, le, count])
+            except Exception:
+                continue
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+@app.get('/admin/metrics/lease_wait_breakdown')
+async def lease_wait_breakdown(dep=Depends(auth_dependency)):
+    db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+    buckets = [0.001,0.01,0.05,0.1,0.25,0.5,1,2,5,10]
+    out = {}
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute("SELECT tool, seconds FROM lease_wait_samples") as cur:
+            async for tool,sec in cur:
+                # find bucket
+                b = next((b for b in buckets if sec <= b), "inf")
+                out.setdefault(tool, {}).setdefault(str(b), 0)
+                out[tool][str(b)] += 1
+    return {"buckets": buckets, "counts": out}
+
+
+@app.get('/admin/export/run_timeline/{run_id}.csv')
+async def export_run_timeline(run_id: str, dep=Depends(auth_dependency)):
+    db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["step_id","started_at","ended_at","duration_sec"])
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute("SELECT step_id, started_at, ended_at FROM executions WHERE run_id=?", (run_id,)) as cur:
+            async for step_id, st, en in cur:
+                dur = (en - st) if (st and en) else None
+                w.writerow([step_id, st, en, dur])
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+@app.get('/admin/trace/{trace_id}')
+async def get_trace(trace_id: str, dep=Depends(auth_dependency)):
+    base = os.getenv('TRACE_API_BASE','').rstrip('/')
+    if not base:
+        raise HTTPException(status_code=501, detail="TRACE_API_BASE not configured")
+    url = f"{base}/{trace_id}"
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url) as r:
+            if r.status != 200:
+                raise HTTPException(status_code=r.status, detail=await r.text())
+            data = await r.text()
+            return Response(content=data, media_type=r.headers.get("content-type","application/json"))
+
+
+@app.get('/admin/export/lease_heat.csv')
+async def export_lease_heat(dep=Depends(auth_dependency)):
+    db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+    buckets = [0.001,0.01,0.05,0.1,0.25,0.5,1,2,5,10]
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["tool","persona","bucket_le","count"])
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute("SELECT tool, COALESCE(persona,'unknown'), seconds FROM lease_wait_samples") as cur:
+            async for tool, persona, sec in cur:
+                b = next((b for b in buckets if sec <= b), None)
+                le = str(b) if b is not None else "inf"
+                w.writerow([tool, persona, le, 1])
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+@app.get('/admin/metrics/durations_series')
+async def durations_series(limit: int = 200, dep=Depends(auth_dependency)):
+    db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+    rows = []
+    async with aiosqlite.connect(db_path) as db:
+        # derive duration from executions
+        async with db.execute("SELECT started_at, ended_at FROM executions WHERE started_at IS NOT NULL AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?", (limit,)) as cur:
+            async for st, en in cur:
+                rows.append({"ts": int(en), "duration": float(en - st)})
+    rows.sort(key=lambda r: r["ts"])
+    return {"points": rows}
+
+
+@app.get('/admin/trace/{trace_id}/spans')
+async def get_trace_spans(trace_id: str, dep=Depends(auth_dependency)):
+    """Return spans for a trace_id using local executions table as source of truth.
+    Falls back to synthetic spans if schema lacks columns.
+    """
+    db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+    rows = []
+    async with aiosqlite.connect(db_path) as db:
+        # Try to read rich execution info; many schemas will have these columns
+        try:
+            q = """
+            SELECT e.id, e.trace_id, e.step_id, e.tool, e.persona, e.started_at, e.ended_at
+            FROM executions e
+            WHERE e.trace_id = ? AND e.started_at IS NOT NULL AND e.ended_at IS NOT NULL
+            ORDER BY e.started_at ASC
+            """
+            async with db.execute(q, (trace_id,)) as cur:
+                async for span_id, t_id, step_id, tool, persona, st, en in cur:
+                    dur = float(en - st)
+                    rows.append({
+                        "span_id": str(span_id),
+                        "trace_id": t_id,
+                        "name": f"{tool or 'step'}:{step_id}",
+                        "tool": tool,
+                        "persona": persona or "unknown",
+                        "start": float(st),
+                        "end": float(en),
+                        "duration": dur
+                    })
+        except Exception:
+            # Fallback to any executions for that trace
+            try:
+                q = "SELECT id, started_at, ended_at FROM executions WHERE trace_id = ?"
+                async with db.execute(q, (trace_id,)) as cur:
+                    async for span_id, st, en in cur:
+                        if st is None or en is None: 
+                            continue
+                        rows.append({
+                            "span_id": str(span_id),
+                            "trace_id": trace_id,
+                            "name": f"exec:{span_id}",
+                            "tool": None,
+                            "persona": "unknown",
+                            "start": float(st),
+                            "end": float(en),
+                            "duration": float(en-st)
+                        })
+            except Exception:
+                pass
+    # Normalize & compute relative offsets
+    if rows:
+        t0 = min(r["start"] for r in rows)
+        for r in rows:
+            r["offset"] = r["start"] - t0
+    return {"spans": rows}
+
+
+@app.get('/admin/export/trace_spans.csv')
+async def export_trace_spans(trace_id: str, dep=Depends(auth_dependency)):
+    db_path = os.getenv('ORCH_QUEUE_DB','/tmp/orchestrator_queue.db')
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["span_id","trace_id","name","tool","persona","start","end","duration","offset"])
+    # Reuse API to avoid dup logic
+    from fastapi import Request
+    data = await get_trace_spans(trace_id)
+    for s in data.get("spans", []):
+        w.writerow([s.get("span_id"), s.get("trace_id"), s.get("name"), s.get("tool"), s.get("persona"),
+                    s.get("start"), s.get("end"), s.get("duration"), s.get("offset")])
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+
+def _compute_critical_path(spans):
+    """Given spans with start,end,duration, compute a max-duration non-overlapping chain.
+    Uses weighted interval scheduling DP on (end) sorted spans.
+    Returns indices of chosen spans in input order.
+    """
+    if not spans:
+        return []
+    # Sort spans by end time, but keep original reference
+    order = sorted(range(len(spans)), key=lambda i: spans[i]["end"])
+    ends = [spans[i]["end"] for i in order]
+    # p(j): rightmost i < j with spans[order[i]].end <= spans[order[j]].start
+    import bisect
+    starts_sorted = [spans[i]["start"] for i in order]
+    p = []
+    for j, idx in enumerate(order):
+        # find rightmost end <= start_j
+        sj = spans[idx]["start"]
+        i = bisect.bisect_right(ends, sj) - 1
+        p.append(i)
+    # DP
+    n = len(order)
+    M = [0.0]*(n+1)
+    choose = [False]*n
+    for j in range(1, n+1):
+        w = spans[order[j-1]]["duration"]
+        if p[j-1] >= 0:
+            incl = w + M[p[j-1]+1]
+        else:
+            incl = w
+        excl = M[j-1]
+        if incl >= excl:
+            M[j] = incl
+            choose[j-1] = True
+        else:
+            M[j] = excl
+            choose[j-1] = False
+    # Recover solution
+    res = []
+    j = n
+    while j > 0:
+        if choose[j-1]:
+            res.append(order[j-1])
+            j = p[j-1] + 1
+        else:
+            j -= 1
+    res.reverse()
+    return res
+
+@app.get('/admin/trace/{trace_id}/critical_path')
+async def get_critical_path(trace_id: str, dep=Depends(auth_dependency)):
+    base = await get_trace_spans(trace_id)
+    spans = base.get("spans", [])
+    idxs = _compute_critical_path(spans)
+    path = [spans[i] for i in idxs]
+    total = sum(s.get("duration",0.0) for s in path)
+    return {"total_duration": total, "count": len(path), "spans": path}
+
+@app.get('/admin/export/critical_path.csv')
+async def export_critical_path(trace_id: str, dep=Depends(auth_dependency)):
+    data = await get_critical_path(trace_id)
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["span_id","trace_id","name","tool","persona","start","end","duration","offset"])
+    for s in data.get("spans", []):
+        w.writerow([s.get("span_id"), s.get("trace_id"), s.get("name"), s.get("tool"), s.get("persona"),
+                    s.get("start"), s.get("end"), s.get("duration"), s.get("offset")])
+    return Response(content=buf.getvalue(), media_type="text/csv")
+
+from services.refactor.main import mount as mount_refactor
+try:
+    mount_refactor(app)
+except Exception:
+    pass
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+
+def _call_tool(tool_name, fn, payload):
+    """Wrap a tool call to emit metrics, enforce schema validation, and support async functions."""
+    import asyncio, time as _time
+    is_coro = asyncio.iscoroutinefunction(fn)
+    start = _time.perf_counter()
+    try:
+        if is_coro:
+            result = asyncio.get_event_loop().run_until_complete(fn(payload))
+        else:
+            result = fn(payload)
+        # success metric
+        try:
+            ORCH_TOOL_CALLS.labels(tool=tool_name, status="success").inc()
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        # failure metric
+        try:
+            ORCH_TOOL_CALLS.labels(tool=tool_name, status="failure").inc()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            dur = _time.perf_counter() - start
+            ORCH_STEP_LATENCY.labels(step=f"tool:{tool_name}").observe(dur)
+        except Exception:
+            pass

@@ -1,0 +1,28 @@
+name: CI
+on: [push]
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: pass
+          POSTGRES_DB: db
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with: python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Start ledger service
+        run: python services/ledger-service/main.py & sleep 2
+      - name: Smoke test ledger
+        run: |
+          python - <<'PY'
+import requests
+print(requests.get('http://127.0.0.1:8003/stats').status_code)
+PY
