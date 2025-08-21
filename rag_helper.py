@@ -2,7 +2,7 @@
 import os, pickle, hashlib, time
 from typing import List, Dict, Any
 # Reusable RAG helper that wraps the persistent VectorStore implementation.
-from services.retrieval.vector_store import VectorStore
+from services.retrieval.vector_store import SimpleVectorStore as VectorStore
 
 MODEL_NAME = os.getenv("RAG_MODEL_NAME", "all-MiniLM-L6-v2")
 DEFAULT_DB_PATH = os.getenv("RAG_VECTOR_DB_PATH", "./data/rag_vectors")
@@ -12,7 +12,8 @@ class RagStore:
         self.path = path or DEFAULT_DB_PATH
         self.model_name = model_name or MODEL_NAME
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        self.store = VectorStore(self.path, model_name=self.model_name)
+        # The underlying SimpleVectorStore does not accept a model_name, so we don't pass it.
+        self.store = VectorStore(self.path)
     def seed_from_folder(self, folder: str):
         # read text files from folder and add to store
         texts = []

@@ -10,7 +10,14 @@ class Settings:
     MODEL_SUMMARIZER = os.getenv("MODEL_SUMMARIZER") or OPENROUTER_DEFAULT_MODEL
     RAG_VECTOR_DB_PATH = os.getenv("RAG_VECTOR_DB_PATH", "/mnt/data/ai-code-agent-elite/rag_store.pkl")
     ALLOW_INTERNET = os.getenv("ALLOW_INTERNET", "false").lower() == "true"
-    PRICE_PER_1K_INPUT = float(os.getenv("PRICE_PER_1K_INPUT", "0.002"))
-    PRICE_PER_1K_OUTPUT = float(os.getenv("PRICE_PER_1K_OUTPUT", "0.008"))
+
+    def _get_float_env(key, default):
+        try:
+            return float(os.getenv(key, default))
+        except (ValueError, TypeError):
+            return float(default)
+
+    PRICE_PER_1K_INPUT = _get_float_env("PRICE_PER_1K_INPUT", "0.002")
+    PRICE_PER_1K_OUTPUT = _get_float_env("PRICE_PER_1K_OUTPUT", "0.008")
 
 settings = Settings()

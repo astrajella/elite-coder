@@ -2,10 +2,16 @@
 import asyncio, time
 from services.orchestrator import queue_sqlite as q
 
+import aiosqlite
+from services.orchestrator.queue_sqlite import DB_PATH
+
 def test_fairness_and_reaper_smoke():
     async def _run():
         await q.init()
-        # ensure clean-ish slate (not deleting DB for simplicity)
+        # ensure clean slate
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM runs_queue")
+            await db.commit()
         await q.set_project_weight('A', 1)
         await q.set_project_weight('B', 3)
         # enqueue

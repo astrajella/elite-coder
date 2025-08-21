@@ -16,6 +16,7 @@ def validate_payload(schema_name: str, payload: Dict[str, Any]) -> Dict[str, Any
         result = post_json(url, {"schema_name": schema_name, "payload": payload})
         if not result.get("valid", False):
             return {"valid": False, "errors": result.get("errors", [])}
-        return {"valid": True, "errors": []}
+        # On success, return the validated and potentially transformed payload
+        return {"valid": True, "payload": result.get("payload", payload), "errors": []}
     except Exception as e:
         return {"valid": False, "errors": [{"loc":["request"], "msg": str(e), "type":"request_error"}]}

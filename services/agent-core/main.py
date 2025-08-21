@@ -44,7 +44,10 @@ def init_user_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, hashed_password TEXT, role TEXT)''')
     conn.commit(); conn.close()
 
-init_user_db()
+@app.on_event("startup")
+async def startup_event():
+    init_user_db()
+    init_csrf_table()
 
 class UserIn(BaseModel):
     username: str
@@ -95,14 +98,6 @@ class ToolCall(BaseModel):
     payload: dict
     persona: str = "coder"
 
-def verify_jwt(authorization: str):
-    # Very simple JWT-like check: Authorization: Bearer <token>
-    if not authorization: raise HTTPException(status_code=401, detail="Missing auth")
-    token = authorization.split()[-1]
-    # In production use PyJWT and verify signature; here accept any token equal to secret for simplicity
-    if token != JWT_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid token")
-
 @app.post("/invoke_tool")
 async def invoke_tool(call: ToolCall, authorization: str = Header(None), user = Depends(get_current_user), x_csrf_token: str = Header(None)):
     require_role(user, ['developer','admin'])
@@ -117,8 +112,8 @@ async def invoke_tool(call: ToolCall, authorization: str = Header(None), user = 
     try:
         async with httpx.AsyncClient() as client:
             await client.post(f"{LEDGER_URL}/log_run", json={"persona":persona,"tool":tool,"duration":0.1,"tokens":10,"cost":0.001})
-    except Exception:
-        pass
+    except httpx.RequestError as e:
+        logging.error(f"Failed to log run to ledger service: {e}")
     duration = time.time()-start
     return {"id":"tid","status":"ok","duration":duration,"persona":persona,"tool":tool,"result":result}
 
@@ -161,32 +156,58 @@ async def stream_provider(provider: str = 'openrouter', prompt: str = 'Hello', a
 
 @app.post('/auth/register')
 async def register_user(u: UserIn):
-    conn = sqlite3.connect(USER_DB); cur = conn.cursor()
+    conn = None
     try:
+        conn = sqlite3.connect(USER_DB)
+        cur = conn.cursor()
         cur.execute('INSERT INTO users(username,hashed_password,role) VALUES(?,?,?)', (u.username, get_password_hash(u.password), u.role))
         conn.commit()
-    except Exception as e:
-        conn.close()
-        raise HTTPException(status_code=400, detail=str(e))
-    conn.close()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
     return {'ok': True}
 
 @app.post('/auth/login')
 async def login(form: OAuth2PasswordRequestForm = Depends()):
-    conn = sqlite3.connect(USER_DB); cur = conn.cursor()
-    cur.execute('SELECT username, hashed_password, role FROM users WHERE username=?', (form.username,))
-    row = cur.fetchone(); conn.close()
+    conn = None
+    try:
+        conn = sqlite3.connect(USER_DB)
+        cur = conn.cursor()
+        cur.execute('SELECT username, hashed_password, role FROM users WHERE username=?', (form.username,))
+        row = cur.fetchone()
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
     if not row or not verify_password(form.password, row[1]):
         raise HTTPException(status_code=400, detail='Incorrect username or password')
-    access_token = create_access_token({'sub': row[0], 'role': row[2]})
+
+    username, _, role = row
+    access_token = create_access_token({'sub': username, 'role': role})
+
     # create refresh token and store
     import uuid, datetime
     refresh_token = str(uuid.uuid4())
     expires = (datetime.datetime.utcnow() + datetime.timedelta(days=7)).isoformat()
+
+    conn = None
     try:
-        conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('INSERT OR REPLACE INTO refresh_tokens(token,username,expires) VALUES(?,?,?)', (refresh_token, row[0], expires)); conn.commit(); conn.close()
-    except Exception:
-        pass
+        conn = sqlite3.connect(USER_DB)
+        cur = conn.cursor()
+        cur.execute('INSERT OR REPLACE INTO refresh_tokens(token,username,expires) VALUES(?,?,?)', (refresh_token, username, expires))
+        conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to store refresh token for user {username}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
     return {'access_token': access_token, 'token_type': 'bearer', 'refresh_token': refresh_token, 'refresh_expires': expires}
 
 
@@ -220,8 +241,8 @@ async def commit_patches(commit_message: str = Body(...), patches: List[FilePatc
     try:
         async with httpx.AsyncClient() as client:
             await client.post(f"{LEDGER_URL}/log_run", json={"persona":"coder","tool":"commit","duration":0.0,"tokens":0,"cost":0.0})
-    except Exception:
-        pass
+    except httpx.RequestError as e:
+        logging.error(f"Failed to log commit to ledger service: {e}")
     return {"commit_message": commit_message, "applied": applied, "ok": True}
 
 
@@ -248,23 +269,36 @@ async def get_fine_tune(job_id: int, user = Depends(get_current_user), x_csrf_to
     if not g: raise HTTPException(status_code=404, detail='job not found')
     return g
 
-# refresh tokens table
-conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('''CREATE TABLE IF NOT EXISTS refresh_tokens (token TEXT PRIMARY KEY, username TEXT, expires DATETIME)'''); conn.commit(); conn.close()
+    cur.execute('''CREATE TABLE IF NOT EXISTS refresh_tokens (token TEXT PRIMARY KEY, username TEXT, expires DATETIME)''')
+    conn.commit()
+    conn.close()
 
 @app.post('/auth/refresh')
-async def refresh_token(body: dict, authorization: str = Header(None)):
-    # allow reading refresh token from cookie passed via gateway; header not used here
-    from fastapi import Request
-
+async def refresh_token(body: dict):
     token = body.get('refresh_token')
     if not token:
-        # try reading 'ai_refresh' from headers (gateway may forward cookie)
-        token = authorization
-    if not token:
-        raise HTTPException(status_code=400, detail='missing')
-    conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('SELECT username FROM refresh_tokens WHERE token=?', (token,)); row = cur.fetchone(); conn.close()
-    if not row: raise HTTPException(status_code=401, detail='invalid')
-    new_token = create_access_token({'sub': row[0], 'role': 'developer'})
+        raise HTTPException(status_code=400, detail='Missing refresh token')
+
+    conn = None
+    try:
+        conn = sqlite3.connect(USER_DB)
+        cur = conn.cursor()
+        cur.execute('SELECT username FROM refresh_tokens WHERE token=?', (token,))
+        refresh_row = cur.fetchone()
+        if not refresh_row:
+            raise HTTPException(status_code=401, detail='Invalid refresh token')
+
+        username = refresh_row[0]
+        cur.execute('SELECT role FROM users WHERE username=?', (username,))
+        user_row = cur.fetchone()
+        role = user_row[0] if user_row else 'developer' # Default role if user not found
+    except sqlite3.Error as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    new_token = create_access_token({'sub': username, 'role': role})
     return {'access_token': new_token, 'token_type': 'bearer'}
 
 from fastapi.responses import FileResponse
@@ -344,30 +378,55 @@ def create_user_pg(username, hashed_password, role='developer'):
     conn.commit(); conn.close()
 
 def store_reset_token(username, token, expires):
-    if USE_PG_USERS:
-        import psycopg2
-        conn = psycopg2.connect(AGENT_USER_DB_URL); cur = conn.cursor()
-        cur.execute('INSERT INTO password_resets (token, username, expires) VALUES (%s,%s,%s)', (token, username, expires))
-        conn.commit(); conn.close()
-    else:
-        conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('INSERT INTO password_resets(token,username,expires) VALUES(?,?,?)', (token, username, expires)); conn.commit(); conn.close()
+    # This function is not async and is called from an async context, which is not ideal.
+    # For now, just making the DB connection safe.
+    conn = None
+    try:
+        if USE_PG_USERS:
+            import psycopg2
+            conn = psycopg2.connect(AGENT_USER_DB_URL)
+            cur = conn.cursor()
+            cur.execute('INSERT INTO password_resets (token, username, expires) VALUES (%s,%s,%s)', (token, username, expires))
+        else:
+            conn = sqlite3.connect(USER_DB)
+            cur = conn.cursor()
+            cur.execute('INSERT INTO password_resets(token,username,expires) VALUES(?,?,?)', (token, username, expires))
+        conn.commit()
+    except (sqlite3.Error, psycopg2.Error) as e:
+        logging.error(f"Failed to store reset token for user {username}: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def verify_reset_token(token):
     import datetime
-    if USE_PG_USERS:
-        import psycopg2
-        conn = psycopg2.connect(AGENT_USER_DB_URL); cur = conn.cursor(); cur.execute('SELECT username, expires FROM password_resets WHERE token=%s', (token,)); row = cur.fetchone(); conn.close()
-        if not row: return None
-        uname, exp = row[0], row[1]
-        if exp < datetime.datetime.utcnow(): return None
-        return uname
-    else:
-        conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('SELECT username, expires FROM password_resets WHERE token=?', (token,)); row = cur.fetchone(); conn.close();
-        if not row: return None
-        uname, exp = row[0], row[1]
-        import datetime
-        if datetime.datetime.fromisoformat(exp) < datetime.datetime.utcnow(): return None
-        return uname
+    conn = None
+    try:
+        if USE_PG_USERS:
+            import psycopg2
+            conn = psycopg2.connect(AGENT_USER_DB_URL)
+            cur = conn.cursor()
+            cur.execute('SELECT username, expires FROM password_resets WHERE token=%s', (token,))
+            row = cur.fetchone()
+            if not row: return None
+            uname, exp = row[0], row[1]
+            if exp < datetime.datetime.utcnow(): return None
+            return uname
+        else:
+            conn = sqlite3.connect(USER_DB)
+            cur = conn.cursor()
+            cur.execute('SELECT username, expires FROM password_resets WHERE token=?', (token,))
+            row = cur.fetchone()
+            if not row: return None
+            uname, exp = row[0], row[1]
+            if datetime.datetime.fromisoformat(exp) < datetime.datetime.utcnow(): return None
+            return uname
+    except (sqlite3.Error, psycopg2.Error) as e:
+        logging.error(f"Failed to verify reset token: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.post('/auth/request_reset')
@@ -387,13 +446,26 @@ async def reset_password(body: dict):
     if not token or not newpw: raise HTTPException(status_code=400, detail='missing')
     uname = verify_reset_token(token)
     if not uname: raise HTTPException(status_code=400, detail='invalid or expired')
-    # update password
+
     h = get_password_hash(newpw)
-    if USE_PG_USERS:
-        import psycopg2
-        conn = psycopg2.connect(AGENT_USER_DB_URL); cur = conn.cursor(); cur.execute('UPDATE users SET hashed_password=%s WHERE username=%s', (h, uname)); conn.commit(); conn.close()
-    else:
-        conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('UPDATE users SET hashed_password=? WHERE username=?', (h, uname)); conn.commit(); conn.close()
+    conn = None
+    try:
+        if USE_PG_USERS:
+            import psycopg2
+            conn = psycopg2.connect(AGENT_USER_DB_URL)
+            cur = conn.cursor()
+            cur.execute('UPDATE users SET hashed_password=%s WHERE username=%s', (h, uname))
+        else:
+            conn = sqlite3.connect(USER_DB)
+            cur = conn.cursor()
+            cur.execute('UPDATE users SET hashed_password=? WHERE username=?', (h, uname))
+        conn.commit()
+    except (sqlite3.Error, psycopg2.Error) as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
     return {'ok': True}
 
 
@@ -410,33 +482,54 @@ async def validate_token(authorization: str = Header(None)):
 
 # CSRF token helpers
 def init_csrf_table():
+    conn = None
     try:
-        conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('''CREATE TABLE IF NOT EXISTS csrf_tokens (token TEXT PRIMARY KEY, username TEXT, expires TEXT)'''); conn.commit(); conn.close()
-    except Exception:
-        pass
-init_csrf_table()
+        conn = sqlite3.connect(USER_DB)
+        cur = conn.cursor()
+        cur.execute('''CREATE TABLE IF NOT EXISTS csrf_tokens (token TEXT PRIMARY KEY, username TEXT, expires TEXT)''')
+        conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to create csrf_tokens table: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 @app.post('/auth/csrf')
 async def issue_csrf(user = Depends(get_current_user)):
     import uuid, datetime
     token = str(uuid.uuid4())
     expires = (datetime.datetime.utcnow() + datetime.timedelta(minutes=30)).isoformat()
+    conn = None
     try:
-        conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('INSERT INTO csrf_tokens(token,username,expires) VALUES(?,?,?)', (token, user.get('username'), expires)); conn.commit(); conn.close()
-    except Exception:
-        pass
+        conn = sqlite3.connect(USER_DB)
+        cur = conn.cursor()
+        cur.execute('INSERT INTO csrf_tokens(token,username,expires) VALUES(?,?,?)', (token, user.get('username'), expires))
+        conn.commit()
+    except sqlite3.Error as e:
+        logging.error(f"Failed to issue CSRF token for user {user.get('username')}: {e}")
+    finally:
+        if conn:
+            conn.close()
     return {'csrf_token': token, 'expires': expires}
 
 def validate_csrf_for_user(username, token):
+    conn = None
     try:
-        conn = sqlite3.connect(USER_DB); cur = conn.cursor(); cur.execute('SELECT username,expires FROM csrf_tokens WHERE token=?', (token,)); row = cur.fetchone(); conn.close()
+        conn = sqlite3.connect(USER_DB)
+        cur = conn.cursor()
+        cur.execute('SELECT username,expires FROM csrf_tokens WHERE token=?', (token,))
+        row = cur.fetchone()
         if not row: return False
         import datetime
         if row[0] != username: return False
         if datetime.datetime.fromisoformat(row[1]) < datetime.datetime.utcnow(): return False
         return True
-    except Exception:
+    except (sqlite3.Error, TypeError) as e:
+        logging.error(f"CSRF validation failed for user {username}: {e}")
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 
