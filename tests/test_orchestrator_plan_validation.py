@@ -3,7 +3,7 @@ def test_plan_validation_smoke():
     from pydantic import BaseModel, ValidationError
     from typing import List, Optional
     class PlanStep(BaseModel):
-        step_id: Optional[str]
+        step_id: Optional[str] = None
         description: str
         persona: Optional[str] = 'coder'
         tool: Optional[str] = 'generate_code'

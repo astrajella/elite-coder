@@ -42,7 +42,7 @@ def _metrics(resp):
         # add correlation id header
         resp.headers["x-correlation-id"] = getattr(g, "correlation_id", "")
     except Exception as e:
-        pass
+        logger.error("Failed to record metrics", exc_info=e)
     return resp
 
 @app.route("/metrics")
@@ -94,7 +94,11 @@ def sse_event(kind, payload):
 @app.get("/sse/run")
 def sse_run():
     goal = request.args.get("goal","Build feature")
-    top_k = int(request.args.get("top_k","3"))
+    try:
+        top_k = int(request.args.get("top_k","3"))
+    except ValueError:
+        return Response(sse_event("error", {"msg": "top_k must be an integer"}), mimetype='text/event-stream', status=400)
+
     def gen():
         yield sse_event("status", {"msg": "retrieve"})
         retrieved = rag.top_k(goal, top_k=top_k)
@@ -144,8 +148,11 @@ def api_models():
 def api_history():
     try:
         from ledger import get_history  # assume local helper wired to DB
-        rows = get_history(limit=int(request.args.get("limit",50)))
+        limit = int(request.args.get("limit",50))
+        rows = get_history(limit=limit)
         return jsonify({"items": rows})
+    except ValueError:
+        return jsonify({"code": 400, "message": "limit parameter must be an integer"}), 400
     except Exception as e:
         app.logger.error({"event":"history_error","error":str(e)})
         return jsonify({"error":"history unavailable"}), 500
@@ -154,10 +161,19 @@ def api_history():
 @app.get("/api/artifacts")
 def api_artifacts():
     items = []
-    for fn in os.listdir(WORK_DIR):
-        if fn.startswith("artifact_") and fn.endswith(".zip"):
-            p = os.path.join(WORK_DIR, fn)
-            items.append({"name": fn, "size": os.path.getsize(p), "path": p})
+    try:
+        for fn in os.listdir(WORK_DIR):
+            if fn.startswith("artifact_") and fn.endswith(".zip"):
+                p = os.path.join(WORK_DIR, fn)
+                try:
+                    items.append({"name": fn, "size": os.path.getsize(p), "path": p})
+                except FileNotFoundError:
+                    # File might have been deleted between listdir and getsize, just skip it
+                    logger.warning("artifact_file_disappeared", path=p)
+                    continue
+    except OSError as e:
+        logger.error("artifacts_error", error=str(e))
+        return jsonify({"error": "cannot list artifacts"}), 500
     return jsonify(items)
 
 
@@ -167,20 +183,40 @@ def api_apply_patches():
     ok, info = validate("CodePatchList", body)
     if not ok:
         return jsonify({"code":400, "message":"Invalid CodePatchList", "details": info}), 400
-    for p in body["patches"]:
-        target = os.path.join(WORK_DIR, p["path"])
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with open(target, "w", encoding="utf-8") as f:
-            f.write(p["content"])
+
+    for p in body.get("patches", []):
+        path = p.get("path")
+        if not path:
+            # Skip patches with no path
+            continue
+
+        target_path = os.path.abspath(os.path.join(WORK_DIR, path))
+
+        # Security: Ensure the path is within the working directory
+        if not target_path.startswith(os.path.abspath(WORK_DIR)):
+            log.warning("path_traversal_attempt", requested_path=path)
+            return jsonify({"code": 400, "message": f"Path traversal attempt blocked for path: {path}"}), 400
+
+        try:
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with open(target_path, "w", encoding="utf-8") as f:
+                f.write(p.get("content", ""))
+        except IOError as e:
+            log.error("file_write_error", path=target_path, error=str(e))
+            return jsonify({"code": 500, "message": f"Error writing to file: {path}"}), 500
+
     return jsonify({"ok": True})
 
 @app.post("/api/rag/search")
 def api_rag_search():
     body = request.get_json(silent=True) or {}
     q = body.get("q","")
-    k = int(body.get("k",3))
-    hops = int(body.get("hops",1))
-    expansion_k = int(body.get("expansion_k",2))
+    try:
+        k = int(body.get("k",3))
+        hops = int(body.get("hops",1))
+        expansion_k = int(body.get("expansion_k",2))
+    except (ValueError, TypeError):
+        return jsonify({"code": 400, "message": "Parameters 'k', 'hops', and 'expansion_k' must be integers."}), 400
     if hops and hops>1 and hasattr(rag, 'multi_hop'):
         results = rag.multi_hop(q, top_k=k, hops=hops, expansion_k=expansion_k)
     else:

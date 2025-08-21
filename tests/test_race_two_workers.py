@@ -23,8 +23,17 @@ async def worker(run_id, step_id, owner, delay=0.0):
         await lease_release(run_id, step_id, lease)
     return result
 
+import aiosqlite
+from services.orchestrator.queue_sqlite import DB_PATH
+
 def test_two_workers_race():
     async def _run():
+        # Ensure clean state before test
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("DELETE FROM leases")
+            await db.execute("DELETE FROM executions")
+            await db.commit()
+
         await init(); await init_run_steps(); await init_leases(); await init_executions()
         run_id, step_id = 'race-run', 'race-step'
         # Two concurrent workers

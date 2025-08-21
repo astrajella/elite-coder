@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI, Depends, Query
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,11 +11,17 @@ from ..shared.auth import auth_dependency
 
 app = FastAPI(title="retrieval-service")
 
+# More restrictive CORS policy
+allowed_origins = os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+if not allowed_origins or allowed_origins == [""]:
+    allowed_origins = ["http://localhost:3000"] # Default for local dev
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Prometheus metrics
@@ -49,8 +56,9 @@ def tool_retrieve_rag(body: SearchBody, dep=Depends(auth_dependency)):
         RETRIEVAL_LATENCY.labels(endpoint=ep, mode="multi" if body.hops>1 else "single").observe(time.time()-t0)
         return {"retrieved": retrieved, "query_embedding_dim": 384, "hops_used": body.hops}
     except Exception as e:
+        logging.error(f"Error in {ep}: {e}", exc_info=True)
         RETRIEVAL_ERRORS.labels(endpoint=ep).inc()
-        return JSONResponse({"error": "Failed to retrieve information", "detail": str(e)}, status_code=500)
+        return JSONResponse({"error": "Failed to retrieve information"}, status_code=500)
 
 @app.get("/search/code")
 def search_code(q: str = Query(...), top_k: int = 10, mode: str = "hybrid", dep=Depends(auth_dependency)):
@@ -61,5 +69,6 @@ def search_code(q: str = Query(...), top_k: int = 10, mode: str = "hybrid", dep=
         RETRIEVAL_LATENCY.labels(endpoint=ep, mode=mode).observe(time.time()-t0)
         return {"query": q, "top_k": top_k, "mode": mode, "results": res}
     except Exception as e:
+        logging.error(f"Error in {ep}: {e}", exc_info=True)
         RETRIEVAL_ERRORS.labels(endpoint=ep).inc()
-        return JSONResponse({"error":"search failed","detail":str(e)}, status_code=500)
+        return JSONResponse({"error":"search failed"}, status_code=500)

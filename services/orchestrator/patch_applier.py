@@ -14,19 +14,31 @@ def _abs(path: str) -> str:
 def apply_patches(patches: List[Dict[str, Any]]) -> Dict[str, Any]:
     applied = []
     skipped = []
+    errors = []
     for p in patches:
-        path = p["path"]
-        content = p["content"]
-        full = _abs(path)
-        os.makedirs(os.path.dirname(full), exist_ok=True)
-        existing = ""
-        if os.path.exists(full):
-            with open(full, "r", encoding="utf-8", errors="ignore") as f:
-                existing = f.read()
-        if existing == content:
-            skipped.append({"path": path, "reason":"identical"})
-            continue
-        with open(full, "w", encoding="utf-8") as f:
-            f.write(content)
-        applied.append({"path": path, "bytes": len(content)})
-    return {"applied": applied, "skipped": skipped}
+        try:
+            path = p.get("path")
+            content = p.get("content")
+            if path is None or content is None:
+                raise KeyError("Patch must include 'path' and 'content'")
+
+            full = _abs(path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+
+            existing = ""
+            if os.path.exists(full):
+                with open(full, "r", encoding="utf-8", errors="ignore") as f:
+                    existing = f.read()
+
+            if existing == content:
+                skipped.append({"path": path, "reason": "identical"})
+                continue
+
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+            applied.append({"path": path, "bytes": len(content)})
+
+        except (IOError, ValueError, KeyError) as e:
+            errors.append({"path": p.get("path", "unknown"), "error": str(e)})
+
+    return {"applied": applied, "skipped": skipped, "errors": errors}
